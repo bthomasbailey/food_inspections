@@ -4,7 +4,7 @@ library(readr)
 library(dplyr)
 library(stringr)
 
-scrape_header <- function(pg1, id) {
+scrape_header <- function(pg1, id_inspection) {
 
   pg1 <- unlist(str_split(pg1, "\\n"))
   
@@ -17,7 +17,8 @@ scrape_header <- function(pg1, id) {
       str_trim(value)
   }
   
-  data.frame(id = id,
+  data.frame(id_inspection = id_inspection,
+             client_id = extract_value("Client ID:", "Client Name:", F),
              client_name = extract_value("Client Name:", "", F),
              address = extract_value("Address:", "Inspection Date:", F),
              dt_inspection = mdy(extract_value("(?<!Re-)\\sInspection Date:", "", T)),
@@ -36,10 +37,10 @@ scrape_header <- function(pg1, id) {
   
 }
 
-scrape_page <- function(pg, id) {
+scrape_page <- function(pg, id_inspection) {
   
   pg <- unlist(str_split(pg, "\\n"))
-  loc_vio_start <- grep("violation:", pg, ignore.case = T)[1]
+  loc_vio_start <- grep("^violation:", pg, ignore.case = T)[1]
   
   #If page doesn't have any violation info, stop scraping
   if (!is.na(loc_vio_start)) {
@@ -60,6 +61,19 @@ scrape_page <- function(pg, id) {
     violations <- gsub("violation:\\s*", "", violations, ignore.case = T)
     
     comments <- grep("^(violation:)", pg, ignore.case = T, value = T, invert = T)
+    
+    # Remove the text "Comments:" if it does not start the line, so that if it appears again it 
+    # does not mess up the split
+    comments <- vapply(comments, 
+                       function(x) {
+                        if (grepl("^(comments:)", x, ignore.case = T)) {
+                          txt <- gsub("^(comments:)", "", x, ignore.case = T)
+                          str_c("Comments:", gsub("comments:", "", txt, ignore.case = T))
+                        } else {
+                          gsub("comments:", "", x, ignore.case = T)
+                        }
+                      }, FUN.VALUE = character(1), USE.NAMES = F)
+    
     comments <- paste(comments, collapse = "")
     comments <- unlist(str_split(comments, "Comments:"))
     comments <- comments[2:length(comments)]
@@ -70,7 +84,7 @@ scrape_page <- function(pg, id) {
       comments <- gsub("\\s+", " ", comments)
     }
     
-    data.frame(id = id,
+    data.frame(id_inspection = id_inspection,
                violation = violations,
                comments = comments,
                stringsAsFactors = F)
@@ -80,21 +94,31 @@ scrape_page <- function(pg, id) {
 }
 
 
-
-if (!dir.exists("inspections")) {
-  dir.create("inspections")
-}
-
-if (!dir.exists("violations")) {
-  dir.create("violations")
-}
-
 base_url <- "http://appsrv.achd.net/reports/rwservlet?food_rep_insp&P_ENCOUNTER="
 
-dt <- ymd(20040701)
+# dt <- ymd(20040415)
+dt <- ymd(20160324)
+inspections <- data.frame(id = character(),
+                          client_name = character(),
+                          address = character(),
+                          dt_inspection = character(),
+                          city = character(),
+                          state = character(),
+                          zip = character(),
+                          purpose = character(),
+                          municipality = character(),
+                          inspector = character(),
+                          dt_permit_exp = character(),
+                          cat_code = character(),
+                          re_inspection = character(),
+                          dt_re_inspection = character())  
+
+violations <- data.frame(id = character(),
+                         violation = character(),
+                         comments = character())
+
 
 while (dt <= now()) {
-  
   url <- str_c(base_url, gsub("-", "", dt))
 
   print(url)  
@@ -102,26 +126,6 @@ while (dt <= now()) {
   
   i <- 1
   err <- F
-  
-  inspections <- data.frame(id = character(),
-                           client_name = character(),
-                           address = character(),
-                           dt_inspection = character(),
-                           city = character(),
-                           state = character(),
-                           zip = character(),
-                           purpose = character(),
-                           municipality = character(),
-                           inspector = character(),
-                           dt_permit_exp = character(),
-                           cat_code = character(),
-                           re_inspection = character(),
-                           dt_re_inspection = character()
-  )  
-
-  violations <- data.frame(id = character(),
-                           violation = character(),
-                           comments = character())
   
   while (!err) {
     id <- str_c(paste(rep(0, 4 - nchar(i)), collapse = ""), i)
@@ -132,12 +136,15 @@ while (dt <= now()) {
     
     if (length(attr(pdf, "class")) == 0) {
       
-      inspection_data <- scrape_header(pdf[1], id = str_c(gsub("-", "", dt), id))
-      violation_data <- lapply(pdf[2:length(pdf)], scrape_page, id = str_c(gsub("-", "", dt), id))
-      violation_data <- bind_rows(violation_data)
-      
-      inspections <- rbind(inspections, inspection_data)    
-      violations <- rbind(violations, violation_data)    
+      # Make sure report is not blank
+      if (gregexpr("client name:", pdf[1], ignore.case = T)[[1]] != -1) {
+        inspection_data <- scrape_header(pdf[1], id = str_c(gsub("-", "", dt), id))
+        violation_data <- lapply(pdf[2:length(pdf)], scrape_page, id = str_c(gsub("-", "", dt), id))
+        violation_data <- bind_rows(violation_data)
+        
+        inspections <- rbind(inspections, inspection_data)    
+        violations <- rbind(violations, violation_data)    
+      }
       
     } else {
       err <- T
@@ -146,18 +153,13 @@ while (dt <= now()) {
     i <- i + 1
   }
 
-  if (nrow(inspections) > 0) {
-    write_csv(inspections, file.path("inspections", str_c(gsub("-", "", dt), ".csv")))
-  }
-  
-  if (nrow(violations) > 0) {
-    write_csv(violations, file.path("violations", str_c(gsub("-", "", dt), ".csv")))
-  }
-  
   dt <- dt + 1
   
 }
 
+write_csv(inspections, "inspections.csv")
+write_csv(violations, "violations.csv")
 
-
-
+violations <- lapply(grep("violations_\\d\\.csv", list.files(), value = T), read_csv)
+violations <- bind_rows(violations)
+write_csv(violations, "violations.csv")
