@@ -160,6 +160,4 @@ while (dt <= now()) {
 write_csv(inspections, "inspections.csv")
 write_csv(violations, "violations.csv")
 
-violations <- lapply(grep("violations_\\d\\.csv", list.files(), value = T), read_csv)
-violations <- bind_rows(violations)
-write_csv(violations, "violations.csv")
+
