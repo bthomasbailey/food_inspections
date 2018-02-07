@@ -1,63 +1,81 @@
 # -*- coding: utf-8 -*-
 """
 This script uses the recordlinkage package to link restaurants from health
-inspection reports to businesses from Yelp's dataset. State (and Zip if 
-it exists) must be an exact match between the 2 datasets, 
-while name and address can be approximate.
+inspection reports to businesses from Yelp's dataset. Match on Google Place ID first
+and then pick the restaurant with the closest name match (over a certain threshold, i.e. 0.75).
 """
 
 import pandas as pd
 import mysql.connector
 import recordlinkage as rl
+import configparser
+import re
 
-conn = mysql.connector.connect(user = "root", password = "root", database = "yelp_db")
-b = pd.read_sql("SELECT id, name, address, city, state, postal_code " +
-                "FROM business " +  
-                "WHERE state IN ('ON', 'NV', 'IL', 'OH', 'PA');", conn)
-
-r = pd.read_csv("data/restaurants.csv", dtype = object)
-b.rename(columns = {"postal_code":"Zip", "state":"State"}, inplace = True)
-
-# Clean restaurant names to improve matching
-r["Name_clean"] = r.Name.str.replace(r"(^#\d*\s*)|(.[#@]\d+.*)|(\(.*\))", "")
-
-# Strip out punctuation and extra whitespace from both names and addresses in both datasets
-r["Name_clean"] = r.Name_clean.str.replace(r"\W+", "").str.lower()
-r["Address_clean"] = r.Address.str.replace(r"\W+", "").str.lower()
-
-b["Name_clean"] = b.name.str.replace(r"\W+", "").str.lower()                                                        
-b["Address_clean"] = b.address.str.replace(r"\W+", "").str.lower()                                                        
+# Create function to clean restuarant/business names in each dataset to 
+# improve chances of returning a successful match
+def clean_names(df):
+#    re_punct = r"(^#\d*\s*)|(.[#@]\d+.*)|(\(.*\))"
+    pat_common = r"""
+        restaurant|bar|grille?|coffee|caff?e|diner|deli(catessen)?|
+        market|store|shop|kitchen|bakery|foods?|eatery|pub|the|limited"""
+    
+    re_common = re.compile(pat_common, re.VERBOSE|re.IGNORECASE)
+    
+    df["Name_clean"] = df.Name.str.replace(r"\d+", "")
+    df["Name_clean"] = df.Name_clean.str.replace(r"\W+", "")
+    df["Name_clean"] = df.Name_clean.str.replace(re_common, "")
+    df["Name_clean"] = df.Name_clean.str.replace(r"\s+", " ")
+    df["Name_clean"] = df.Name_clean.str.lower()
 
 
-# Too many records to find pairs all at once; subset by state and link 
-rTO = 
+config = configparser.ConfigParser()
+config.read("/home/brent/config.ini")
 
-indexer = rl.BlockIndex(on = "State")
-pairs = indexer.index(r, b)
+goog_rest_inspect = pd.read_csv("data/inspected_restaurants_google_addresses.csv")
+rest_inspect = pd.read_csv("data/restaurants.csv")
+rest_inspect = pd.merge(rest_inspect, goog_rest_inspect, left_on="ID_Rest", right_on="ID")
+rest_inspect = rest_inspect[["ID_Rest", "Name", "google_place_id", "formatted_address"]]
 
+
+goog_yelp = pd.read_csv("data/yelp_google_addresses.csv")
+mysql_user = config["MySQL"]["user"] 
+mysql_pwd = config["MySQL"]["password"] 
+conn = mysql.connector.connect(user = mysql_pwd, password = mysql_pwd, database = "yelp_db")
+yelp = pd.read_sql("SELECT id AS ID_yelp, " + 
+                           "name AS Name, " + 
+                           "address AS Address, " + 
+                           "city AS City, " + 
+                           "state AS State, " + 
+                           "postal_code AS Zip " +
+                   "FROM business " +  
+                   "WHERE state IN ('ON', 'NV', 'IL', 'OH', 'PA');", conn)
+
+yelp = pd.merge(yelp, goog_yelp, left_on="ID_yelp", right_on="ID")
+yelp = yelp[["ID_yelp", "Name", "google_place_id", "formatted_address"]]
+
+clean_names(rest_inspect)
+clean_names(yelp)
+
+indexer = rl.BlockIndex(on = "google_place_id")
+pairs = indexer.index(rest_inspect, yelp)
 c = rl.Compare()
+c.string("Name_clean", "Name_clean", method="levenshtein", label = "match_pct")
 
-c.exact("postal_code", "postal_code", label = "postal_code")
-c.string("Name_clean", "Name_clean", method="levenshtein", label = "Name_clean")
-c.string("Address_clean", "Address_clean", method="levenshtein", label = "Address_clean")
+features = c.compute(pairs, rest_inspect, yelp)
+features["idx_rest_inspect"] = [i[0] for i in features.index]
+features["idx_yelp"] = [i[1] for i in features.index]
 
-features = c.compute(pairs, r, b)
-matches = features[(features.name_clean >= 0.7) & (features.address_clean >= 0.6)]
+features = pd.merge(features, rest_inspect[["ID_Rest","Name", "Name_clean"]], 
+                    left_on="idx_rest_inspect", right_index=True)
+features = pd.merge(features, yelp[["ID_yelp", "Name", "Name_clean"]], 
+                    left_on="idx_yelp", right_index=True)
 
-r_matches = r.loc[[i[0] for i in matches.index]]
-b_matches = b.loc[[i[1] for i in matches.index]]
+features = features[features.match_pct >= 0.75]
+features.reset_index(inplace=True)
 
-r_matches = r_matches[["client_id", "name", "address", "city", "state", 
-                       "postal_code", "municipality", "cat_code"]]
 
-r_matches.rename(columns = {"name":"restaurant_name", "zip":"postal_code", 
-                            "client_id":"restaurant_id"}, inplace = True)
-
-b_matches = b_matches[["id", "name", "address"]]
-b_matches.rename(columns = {"id":"id_yelp"})
-
-r_matches.reset_index(inplace = True)
-b_matches.reset_index(inplace = True)
-
-linked_df = pd.concat([r_matches, b_matches], axis=1)
-
+# In case there are multiple matches for a given idx_rest_inspect, return
+# only the record with the highest name match percentage
+idx_max_pcts = features.groupby(["idx_rest_inspect"])["match_pct"].idxmax()
+features = features.loc[idx_max_pcts]
+features[["ID_Rest", "ID_yelp"]].to_csv("data/linked_ids.csv", encoding="utf8")
